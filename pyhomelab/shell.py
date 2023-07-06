@@ -64,8 +64,7 @@ class Shell:
         if noop is True:
             log.noop("RUNNING: %s", log_cmd)
             return None
-        else:
-            log.debug("RUNNING: %s", cmd)
+        log.debug("RUNNING: %s", cmd)
 
         result = subprocess.run(shlex.split(cmd),
                                 stdout=subprocess.PIPE,

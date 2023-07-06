@@ -13,12 +13,12 @@ logging.addLevelName(logging.TRACE, 'TRACE')
 logging.Logger.trace = functools.partialmethod(logging.Logger.log, logging.TRACE)
 logging.trace = functools.partial(logging.log, logging.TRACE)
 
-logging.SUCCESS = 35
+logging.SUCCESS = 60
 logging.addLevelName(logging.SUCCESS, 'SUCCESS')
 logging.Logger.success = functools.partialmethod(logging.Logger.log, logging.SUCCESS)
 logging.success = functools.partial(logging.log, logging.SUCCESS)
 
-logging.NOOP = 60
+logging.NOOP = 70
 logging.addLevelName(logging.NOOP, 'NOOP')
 logging.Logger.noop = functools.partialmethod(logging.Logger.log, logging.NOOP)
 logging.noop = functools.partial(logging.log, logging.NOOP)

@@ -1,12 +1,16 @@
 '''pyhomelab/oci/__init__.py'''
 import copy
 import pathlib
+import base64
+import datetime as dt
+import time
 import oci
 from pyhomelab.oci.profiles import (OCIBrowserAuthProfile,
                                     OCIAPIConfigProfile,
                                     OCIAPIProfile)
 import pyhomelab.oci.exceptions
 from pyhomelab.security.rsa import RSAWrapper
+from pyhomelab.helper import Helper
 
 
 class OCIWrapper:
@@ -31,6 +35,10 @@ class OCIWrapper:
         identity_client
     kms_vault_client : oci.key_management.KmsVaultClient
         kms_vault_client
+    vault_client : oci.vault.VaultsClient
+        vault_client
+    secrets_client : oci.secrets.SecretsClient
+        secrets client
 
     Methods
     -------
@@ -40,10 +48,17 @@ class OCIWrapper:
     upload_api_key
     create_group
     add_user_to_group
+    get_compartment
     create_compartment
     create_policy
+    get_vaults
     create_vault
     create_vault_key
+    vault_list_secrets
+    vault_get_secret
+    vault_delete_secret_version
+    vault_set_secret
+    vault_delete_secret
     '''
     def __init__(self,
                  profile: OCIBrowserAuthProfile | OCIAPIConfigProfile | OCIAPIProfile
@@ -100,6 +115,8 @@ class OCIWrapper:
         # configuring oci clients
         self.identity_client = oci.identity.IdentityClient(**self.auth)
         self.kms_vault_client = oci.key_management.KmsVaultClient(**self.auth)
+        self.vault_client = oci.vault.VaultsClient(**self.auth)
+        self.secrets_client = oci.secrets.SecretsClient(**self.auth)
 
         self.log.debug('OCIWrapper initialized.')
 
@@ -471,6 +488,45 @@ class OCIWrapper:
         self.log.success(f"Added {user.name} to group {group.name}")
         return group_membership
 
+    def get_compartments(
+            self,
+            name: str = None
+    ) -> list[oci.identity.models.compartment.Compartment]:
+        '''Get compartment
+
+        Parameters
+        ----------
+        name : str
+            name of the compartment to search for
+
+        Returns
+        -------
+        list[oci.identity.models.compartment.Compartment]
+        '''
+
+        compartment_search = {
+            'compartment_id': self.config['tenancy'],
+            'compartment_id_in_subtree': True,
+        }
+
+        try:
+            compartments = self.identity_client.list_compartments(**compartment_search).data
+        except oci.exceptions.ServiceError as err:
+            if err.code == 'NotAuthenticated':
+                raise pyhomelab.oci.exceptions.OCIAuthenticateError(err.message)
+
+        self.log.trace("%i compartments found", len(compartments))
+        compartments = [c for c in compartments if c.lifecycle_state in ['CREATING', 'ACTIVE']]
+        self.log.trace("%i compartments found that are active", len(compartments))
+
+        if name is None:
+            return compartments
+
+        compartments = [c for c in compartments if c.name == name]
+        self.log.trace("%i compartments found with name %s", len(compartments), name)
+
+        return compartments
+
     def create_compartment(
             self,
             name: str,
@@ -658,6 +714,24 @@ class OCIWrapper:
 
         return policy
 
+    def get_vaults(self,
+                   compartment: oci.identity.models.compartment.Compartment,
+                   name: str = None
+    ) -> list[oci.key_management.models.vault_summary.VaultSummary]:
+        '''Get Vault'''
+        vaults = self.kms_vault_client.list_vaults(compartment_id=compartment.id).data
+        self.log.trace("%i vaults found in compartment %s", len(vaults), compartment.name)
+        vaults = [v for v in vaults if v.lifecycle_state in ['ACTIVE', 'CREATING']]
+        self.log.trace("%i vaults found that are active", len(vaults))
+
+        if name is None:
+            return vaults
+
+        vaults = [v for v in vaults if v.display_name]
+        self.log.trace("%i found with name %s", len(vaults), name)
+
+        return vaults
+
     def create_vault(self,
                      name: str,
                      compartment: str,
@@ -688,12 +762,8 @@ class OCIWrapper:
              "vault_type": "DEFAULT"}
         '''
 
-        # get all the vaults in compartment, because you can create multiple vaults with same name
-        vaults = self.kms_vault_client.list_vaults(compartment_id=compartment.id).data
-
         try:
-            vault = [v for v in vaults if (v.display_name == name
-                                            and v.lifecycle_state in ['ACTIVE', 'CREATING'])][0]
+            vault = self.get_vaults(compartment=compartment, name=name)[0]
         except IndexError:
             self.log.debug("Creating Vault...")
             create_vault_details = oci.key_management.models.CreateVaultDetails(
@@ -729,10 +799,63 @@ class OCIWrapper:
 
         return vault
 
+    def list_vault_keys(self,
+                        compartment: oci.identity.models.compartment.Compartment,
+                        vault: oci.key_management.models.vault_summary.VaultSummary,
+                        algorithm: str = None,
+                        name: str = None
+    ) -> list[oci.key_management.models.key_summary.KeySummary]:
+        '''List all the available keys in the vault
+
+        Parameters
+        ----------
+        compartment : oci.identity.models.compartment.Compartment, required
+            compartment to look in
+        vault : oci.key_management.models.vault_summary.VaultSummary, required
+            vault to look in
+        name : str
+            key display_name to search, default = None
+        algorithm : str
+            type of keys to look for, default = None
+            e.g. AES
+
+        Returns
+        -------
+        list[oci.key_management.models.vault_summary.VaultSummary]
+
+        Raises
+        ------
+        oci.exceptions.ServiceError
+            no permission to list keys
+        '''
+        kms_management_client = oci.key_management.kms_management_client.KmsManagementClient(
+                                                **self.auth,
+                                                service_endpoint=vault.management_endpoint)
+
+        # get all keys in vault
+        kms_keys = kms_management_client.list_keys(compartment_id=compartment.id).data
+        self.log.trace("%i keys found in %s vault under %s compartment",
+                       len(kms_keys), vault.display_name, compartment.name)
+        kms_keys = [k for k in kms_keys if k.lifecycle_state in ['CREATING', 'ENABLED']]
+        self.log.trace("%i keys are active", len(kms_keys))
+
+        if algorithm is not None:
+            kms_keys = [k for k in kms_keys if k.algorithm == algorithm]
+            self.log.trace("%i keys found that are %s type.", len(kms_keys), algorithm)
+
+        if name is None:
+            return kms_keys
+
+        kms_keys = [k for k in kms_keys if k.display_name == name]
+        self.log.trace("%i keys filtered with name %s", len(kms_keys), name)
+
+        return kms_keys
+
     def create_vault_key(self,
                          name: str,
                          vault: oci.key_management.models.vault_summary.VaultSummary,
                          compartment: oci.identity.models.compartment.Compartment,
+                         algorithm: str = 'AES',
                          freeform_tags: dict[str, str] = None
     ) -> oci.key_management.models.key_summary.KeySummary:
         '''Create an AES key for encryption
@@ -745,6 +868,8 @@ class OCIWrapper:
             vault object
         compartment_id: oci.identity.models.compartment.Compartment, required
             compartmant OCID
+        algorithm : str
+            type of key to create, default = AES
         freeform_tags : dict[str, str]
             tags to add
 
@@ -761,21 +886,22 @@ class OCIWrapper:
           "protection_mode": "HSM",
           "time_created": "2022-03-12",
           "vault_id": "ocid1.vault.oc1.ca-toronto-1"}
+
+        Raises
+        ------
+        oci.exceptions.ServiceError
+            no permission to list keys
         '''
         # create key client
         kms_management_client = oci.key_management.kms_management_client.KmsManagementClient(
                                                         **self.auth,
                                                         service_endpoint=vault.management_endpoint)
 
-        # set key algorithm. AES is for encryption
-        algorithm: str = 'AES'
-
-        # get all keys in vault
-        kms_keys = kms_management_client.list_keys(compartment_id=compartment.id).data
-
         try:
-            kms_key = [k for k in kms_keys if (k.lifecycle_state in ['ENABLED', 'CREATING'] and
-                                               k.algorithm == algorithm)][0]
+            kms_key = self.list_vault_keys(compartment=compartment,
+                                           vault=vault,
+                                           algorithm=algorithm,
+                                           name=name)[0]
         except IndexError:
             self.log.debug("%s key not found. Will create.", name)
 
@@ -810,3 +936,259 @@ class OCIWrapper:
             self.log.success("Updated vault key %s", kms_key.display_name)
 
         return kms_key
+
+    def vault_list_secrets(self,
+                           compartment: oci.identity.models.compartment.Compartment,
+                           vault: oci.key_management.models.vault_summary.VaultSummary,
+                           name: str = None
+    ) -> list[oci.vault.models.secret_summary.SecretSummary]:
+        '''List all the secrets in Vault
+
+        Parameters
+        ----------
+        compartment : oci.identity.models.compartment.Compartment, required
+            compartment the vault is located in
+        vault : oci.key_management.models.vault_summary.VaultSummary, required
+            vault the secret is in
+        name : str
+            name of the secret to look for
+
+        Returns
+        -------
+        list[oci.vault.models.secret_summary.SecretSummary]
+            [{
+                "compartment_id": "ocid1.compartment.oc1..<REDACTED>",
+                "description": null,
+                "freeform_tags": {},
+                "id": "ocid1.vaultsecret.oc1.ca-toronto-1.<REDACTED",
+                "key_id": "ocid1.key.oc1.ca-toronto-1.<REDACTED>",
+                "lifecycle_details": null,
+                "lifecycle_state": "PENDING_DELETION",
+                "secret_name": "testpassword1234",
+                "time_created": "2023-06-28T01:55:30.571000+00:00",
+                "time_of_current_version_expiry": null,
+                "time_of_deletion": "2023-07-07T03:33:40.534000+00:00",
+                "vault_id": "ocid1.vault.oc1.ca-toronto-1.<REDACTED>"
+            }]
+        '''
+        search = { 'compartment_id': compartment.id,
+                   'vault_id': vault.id}
+        if name is not None:
+            search['name'] = name
+
+        secrets = self.vault_client.list_secrets(**search).data
+        self.log.trace("%i secrets found in vault %s under compartment %s",
+                       len(secrets), vault.display_name, compartment.name)
+        if name is not None:
+            self.log.trace("With secret name %s", name)
+
+        return secrets
+
+    def vault_get_secret(self,
+                         secret: oci.vault.models.secret_summary.SecretSummary,
+                         decode: bool = True) -> str:
+        '''Get Secret Content
+
+        Parameters
+        ----------
+        secret : oci.vault.models.secret_summary.SecretSummary, required
+            the secret
+        decode : bool
+            decode the base64 string, default = False
+
+        Returns
+        -------
+        str
+        '''
+        secret_bundle_content = self.secrets_client.get_secret_bundle(secret_id=secret.id).data
+        secret_bundle_content = secret_bundle_content.secret_bundle_content
+
+        if secret_bundle_content.content_type != 'BASE64':
+            raise NotImplementedError(
+                f"Secret in encoded in {secret_bundle_content.content_type}")
+
+        if decode is True:
+            try:
+                return base64.b64decode(secret_bundle_content.content).decode()
+            except UnicodeDecodeError as err:
+                raise pyhomelab.oci.exceptions.OCISecretDecryptionFailed(
+                    f"Unable to decode base64 secret {secret.secret_name}") from err
+
+        return secret_bundle_content.content
+
+    def vault_delete_secret_version(self,
+                                    secret: oci.vault.models.secret_summary.SecretSummary
+    ) -> None:
+        '''Delete Deprecated secret versions
+
+        Parameters
+        ----------
+        secret : oci.vault.models.secret_summary.SecretSummary, required
+            secrets
+
+        Returns
+        -------
+        None
+        '''
+        secret_versions = self.vault_client.list_secret_versions(secret_id=secret.id).data
+
+        for secret_version in secret_versions:
+            if 'DEPRECATED' in secret_version.stages and secret_version.time_of_deletion is None:
+                self.log.trace("Secret %s version %i is deprecated. Will schedule deletion",
+                               secret.secret_name, secret_version.version_number)
+                time_of_deletion = dt.datetime.now() + dt.timedelta(hours=30)
+                delete_details = oci.vault.models.ScheduleSecretVersionDeletionDetails(
+                                time_of_deletion=time_of_deletion.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+
+                counter = 0
+                while True:
+                    try:
+                        _ = self.vault_client.schedule_secret_version_deletion(
+                                secret_id=secret.id,
+                                secret_version_number=secret_version.version_number,
+                                schedule_secret_version_deletion_details=delete_details)
+                    except oci.exceptions.TransientServiceError as err:
+                        if counter == 10:
+                            raise pyhomelab.oci.exceptions.OCISecretVersionDeletionFailed(
+                                                                                    err) from err
+                        if 'has a conflicting state of UPDATING' in str(err):
+                            self.log.trace("Secret %s is in Updating state. Sleeping for 3 sec",
+                                           secret.secret_name)
+                            counter = counter + 1
+                            time.sleep(3)
+                            continue
+                        self.log.success("Secret %s version %i will be deleted on %s",
+                                         secret.secret_name,
+                                         secret_version.version_number,
+                                         str(time_of_deletion))
+                        break
+
+    def vault_set_secret(self,
+                         compartment: oci.identity.models.compartment.Compartment,
+                         vault: oci.key_management.models.vault_summary.VaultSummary,
+                         key: oci.key_management.models.key_summary.KeySummary,
+                         secret_name: str,
+                         secret_content: str,
+                         description: str = None):
+        '''Set Vault Secret
+
+        Parameters
+        ----------
+        compartment : oci.identity.models.compartment.Compartment, required
+            compartment where vault is located
+        vault : oci.key_management.models.vault_summary.VaultSummary, required
+            vault to store the secret
+        key : oci.key_management.models.key_summary.KeySummary, required
+            key to encrypt secret with
+        secret_name : str, required
+            name of the secret
+        secret_content : str, required
+            string or base64
+        description : str
+            secret description default = None
+
+        Returns
+        -------
+        oci.vault.models.secret_summary.SecretSummary
+        '''
+        # encode the secret content if not encoded
+        if Helper.is_base64_encoded(value=secret_content) is False:
+            self.log.trace('Provided secret content is not base64 encoded. Will encode.')
+            secret_content = base64.b64encode(bytes(secret_content, encoding='utf8')).decode()
+
+        # set secret content details
+        secret_content_details = oci.vault.models.Base64SecretContentDetails(
+            content_type=oci.vault.models.SecretContentDetails.CONTENT_TYPE_BASE64,
+            name=dt.datetime.now().strftime('%Y%m%d%H%M%S'),
+            stage='CURRENT',
+            content=secret_content)
+
+        try:
+            secret = self.vault_list_secrets(compartment=compartment,
+                                             vault=vault,
+                                             name=secret_name)[0]
+        except IndexError:
+            self.log.trace("Secret %s does not exist. Will create.", secret_name)
+
+            create_secret_details = oci.vault.models.CreateSecretDetails(
+                compartment_id=compartment.id,
+                secret_content=secret_content_details,
+                secret_name=secret_name,
+                vault_id=vault.id,
+                description=description,
+                key_id=key.id)
+
+            secret = self.vault_client.create_secret(
+                                                create_secret_details=create_secret_details).data
+            self.log.success("Secret %s created", secret.secret_name)
+            return secret
+
+        self.log.trace("Secret %s exists.", secret.secret_name)
+
+        if secret.lifecycle_state not in ['ACTIVE', 'CREATING']:
+            raise pyhomelab.oci.exceptions.OCISecretUpdateFailed(
+                f"Secret {secret.secret_name} is in {secret.lifecycle_state} state. "
+                'Unable to update')
+
+        # checking current content
+        if self.vault_get_secret(secret=secret, decode=False) == secret_content:
+            self.log.info("Secret %s already set to the provided secret content",
+                          secret.secret_name)
+            return secret
+        self.log.debug("Secret %s needs updating", secret.secret_name)
+
+        # update the secret
+        update_secret_details = oci.vault.models.UpdateSecretDetails(
+                                                            secret_content=secret_content_details)
+        secret = self.vault_client.update_secret(secret_id=secret.id,
+                                                 update_secret_details=update_secret_details).data
+        self.log.success("Secret %s content updated.", secret.secret_name)
+
+        # cleaning up old versions
+        self.vault_delete_secret_version(secret=secret)
+
+        return secret
+
+    def vault_delete_secret(self,
+                            name: str,
+                            compartment: oci.identity.models.compartment.Compartment,
+                            vault: oci.key_management.models.vault_summary.VaultSummary
+    ) -> None:
+        '''Delete a Vault Secret
+
+        Parameters
+        ----------
+        name : str, required
+            Name of the secret
+        compartment : oci.identity.models.compartment.Compartment, required
+            compartment of vault
+        vault : oci.key_management.models.vault_summary.VaultSummary
+            vault of secret location
+
+        Raises
+        ------
+        pyhomelab.oci.exceptions.OCISecretDeletionFailed
+            Secret not in active state
+        '''
+
+        try:
+            secret = self.vault_list_secrets(compartment=compartment, vault=vault, name=name)[0]
+        except IndexError as err:
+            raise pyhomelab.oci.exceptions.OCISecretDoesNotExist(
+                f"Secret {name} does not exist in Vault {vault.display_name} under "
+                f"{compartment.name} compartment") from err
+
+        if secret.lifecycle_state not in ['CREATING', 'ACTIVE']:
+            raise pyhomelab.oci.exceptions.OCISecretDeletionFailed(
+                f"Secret {secret.secret_name} is in {secret.lifecycle_state} state.")
+
+        time_of_deletion = dt.datetime.now() + dt.timedelta(hours=30)
+        self.log.debug("Scheduling secret %s to be deleted on %s",
+                       secret.secret_name, time_of_deletion)
+        delete_details = oci.vault.models.ScheduleSecretDeletionDetails(
+                            time_of_deletion=time_of_deletion.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
+
+        _ = self.vault_client.schedule_secret_deletion(
+                                                secret_id=secret.id,
+                                                schedule_secret_deletion_details=delete_details)
+        self.log.success("Secret %s deleted.", secret.secret_name)
