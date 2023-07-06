@@ -1,6 +1,4 @@
 '''pyhomelab/oci/exceptions.py'''
-import ast
-import re
 import oci
 from pyhomelab.exceptions import PyHomelabException
 
@@ -48,3 +46,18 @@ class OCIAPIKeyUploadFailed(OCIWrapperException):
 
 class OCIVaultNotActive(OCIWrapperException):
     '''Vault not active'''
+
+class OCISecretVersionDeletionFailed(OCIWrapperException):
+    '''OCISecretVersionDeletionFailed'''
+
+class OCISecretDecryptionFailed(OCIWrapperException):
+    '''OCISecretBase64DecryptionError'''
+
+class OCISecretDoesNotExist(OCIWrapperException):
+    '''OCISecretDoesNotExist'''
+
+class OCISecretDeletionFailed(OCIWrapperException):
+    '''OCISecretDeletionFailed'''
+
+class OCISecretUpdateFailed(OCIWrapperException):
+    '''OCISecretUpdateFailed'''
